@@ -19,6 +19,8 @@ from nbclient.util import ensure_async
 from tornado.httputil import split_host_and_port
 from traitlets.traitlets import Bool
 
+from voila.tornado.execution_request_handler import ExecutionRequestHandler
+
 from .configuration import VoilaConfiguration
 
 from ._version import __version__
@@ -72,7 +74,9 @@ class VoilaHandler(BaseVoilaHandler):
         self.template_paths = kwargs.pop("template_paths", [])
         self.traitlet_config = kwargs.pop("config", None)
         self.voila_configuration: VoilaConfiguration = kwargs["voila_configuration"]
-        self.prelaunch_hook = kwargs.get("prelaunch_hook", None)
+        self.prelaunch_hook = self.voila_configuration.prelaunch_hook
+        self.page_config_hook = self.voila_configuration.page_config_hook
+
         # we want to avoid starting multiple kernels due to template mistakes
         self.kernel_started = False
 
@@ -90,9 +94,9 @@ class VoilaHandler(BaseVoilaHandler):
         # Adding request uri to kernel env
         request_info = {}
         request_info[ENV_VARIABLE.SCRIPT_NAME] = self.request.path
-        request_info[
-            ENV_VARIABLE.PATH_INFO
-        ] = ""  # would be /foo/bar if voila.ipynb/foo/bar was supported
+        request_info[ENV_VARIABLE.PATH_INFO] = (
+            ""  # would be /foo/bar if voila.ipynb/foo/bar was supported
+        )
         request_info[ENV_VARIABLE.QUERY_STRING] = str(self.request.query)
         request_info[ENV_VARIABLE.SERVER_SOFTWARE] = f"voila/{__version__}"
         request_info[ENV_VARIABLE.SERVER_PROTOCOL] = str(self.request.version)
@@ -186,6 +190,23 @@ class VoilaHandler(BaseVoilaHandler):
                 return
             mathjax_config = self.settings.get("mathjax_config")
             mathjax_url = self.settings.get("mathjax_url")
+
+            page_config_kwargs = {
+                "base_url": self.base_url,
+                "settings": self.settings,
+                "log": self.log,
+                "voila_configuration": self.voila_configuration,
+            }
+
+            page_config = get_page_config(**page_config_kwargs)
+
+            if self.page_config_hook:
+                page_config = self.page_config_hook(
+                    page_config,
+                    **page_config_kwargs,
+                    notebook_path=notebook_path,
+                )
+
             gen = NotebookRenderer(
                 request_handler=self,
                 voila_configuration=self.voila_configuration,
@@ -197,12 +218,7 @@ class VoilaHandler(BaseVoilaHandler):
                 base_url=self.base_url,
                 kernel_spec_manager=self.kernel_spec_manager,
                 prelaunch_hook=self.prelaunch_hook,
-                page_config=get_page_config(
-                    base_url=self.base_url,
-                    settings=self.settings,
-                    log=self.log,
-                    voila_configuration=self.voila_configuration,
-                ),
+                page_config=page_config,
                 mathjax_config=mathjax_config,
                 mathjax_url=mathjax_url,
             )
@@ -236,6 +252,12 @@ class VoilaHandler(BaseVoilaHandler):
             )
             kernel_future = self.kernel_manager.get_kernel(kernel_id)
             queue = asyncio.Queue()
+            if self.voila_configuration.progressive_rendering:
+                ExecutionRequestHandler._execution_data[kernel_id] = {
+                    "nb": gen.notebook,
+                    "config": self.traitlet_config,
+                    "show_tracebacks": self.voila_configuration.show_tracebacks,
+                }
 
             async def put_html():
                 async for html_snippet, _ in gen.generate_content_generator(
